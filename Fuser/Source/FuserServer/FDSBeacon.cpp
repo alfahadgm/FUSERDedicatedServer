@@ -101,4 +101,15 @@ void FDSBeacon::Start(UWorld* World, UFDSLobbyAuthority* Lobby)
     Host->PauseBeaconRequests(false);
     GHost = Host;
     UE_LOG(LogFDS, Display, TEXT("FDS: session-browser beacon listening on UDP %d (type %s)"), Host->GetListenPort(), *HostObject->GetBeaconType());
+    if (Host->GetListenPort() != World->URL.Port + 100)
+    {
+        UE_LOG(LogFDS, Warning, TEXT("FDS: beacon bound UDP %d, not the game port + 100 (%d; taken, or BeaconPort=): clients look for it there"),
+            Host->GetListenPort(), World->URL.Port + 100);
+    }
+}
+
+int32 FDSBeacon::BoundPort()
+{
+    // InitHost stores the port the beacon net driver actually bound (its URL after InitListen).
+    return GHost.IsValid() ? GHost->GetListenPort() : 0;
 }

@@ -48,7 +48,8 @@ void AHypePlayerState::ServerSetHypeUserId_Implementation(int32 hypeUserId)
         Authority->OnSetHypeUserId(this);
     }
 }
-bool AHypePlayerState::ServerSetHypeUserId_Validate(int32 hypeUserId) { return true; }
+// The native validator refuses -1 (the "no user" id): the sender is disconnected, as by FUSER's own server.
+bool AHypePlayerState::ServerSetHypeUserId_Validate(int32 hypeUserId) { return hypeUserId != -1; }
 
 // FUN_140696300: in Lobby (or Battle_WaitForPlayers) set/clear the Lobby ready bit.
 void AHypePlayerState::ServerSetIsReadyInLobby_Implementation(bool IsReady)
@@ -390,10 +391,17 @@ bool AHypePlayerState::ServerSetXP_Validate(int32 xp) { return true; }
 void AHypePlayerState::ServerSetDLCDownloadState_Implementation(EDLCDownloadState downloadState) {} // non-replicated server field
 bool AHypePlayerState::ServerSetDLCDownloadState_Validate(EDLCDownloadState downloadState) { return true; }
 // The client reports that it applied its state-of-the-world snapshot (FUN_140699ac0 -> FUN_14083e570); FUSER only
-// stores it in a non-replicated server field. Logged: it confirms the snapshot reached and satisfied the client.
+// stores it in a non-replicated server field (PS +0x1112). The authority stops rebuilding that player's snapshot.
 void AHypePlayerState::_ServerSetHasSyncedStateOfTheWorld_Implementation(bool synced)
 {
-    UE_LOG(LogHypeServer, Display, TEXT("FDS: player %d synced the state of the world: %s"), PlayerId, synced ? TEXT("yes") : TEXT("no"));
+    if (IHypeServerAuthority* Authority = IHypeServerAuthority::Get(this))
+    {
+        Authority->OnSetHasSyncedStateOfTheWorld(this, synced);
+    }
+    else
+    {
+        UE_LOG(LogHypeServer, Display, TEXT("FDS: player %d synced the state of the world: %s"), PlayerId, synced ? TEXT("yes") : TEXT("no"));
+    }
 }
 bool AHypePlayerState::_ServerSetHasSyncedStateOfTheWorld_Validate(bool synced) { return true; }
 

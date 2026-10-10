@@ -6,16 +6,27 @@ FDS is a dedicated server for the online multiplayer of **FUSER** (Harmonix, 202
 
 - **Freestyle sessions:**
   - lobby (teams, DJ queue, readiness, leader, an optional public lobby timer)
+  - the set length the session's creator picks (1-3 rounds of 32/64/128 bars; a public session keeps its ticket's rounds), with Game.ini / `FDS_ROUNDS` / `FDS_TURN_MEASURES` as the fallback
+  - a countdown is cancelled, and a set in its turns returns to the Lobby, when no DJ is left; viewers who joined while the DJ slots were full become DJs, in join order, once a slot frees in an idle Lobby
   - sets: music clock, stage driver, DJ actions replayed to every listener, live requests
   - results, the hottest mix and the XP payout
-  - late joiners get the current mix
+  - late joiners get the current mix; their snapshot is rebuilt when the mix or the round changes before their client applies it
 - **Main Stage mode:** one long-running server that plays a schedule of events. Each event's booked headliners DJ in turn, and everyone else watches and reacts.
 - **fuserd integration:** FDS works with fuserd, the companion matchmaking and backend service.
   - It registers with fuserd and sends status heartbeats.
-  - Players are admitted with fuserd-signed Ed25519 session tokens.
+  - Players are admitted with fuserd-signed Ed25519 session tokens. With tokens required, a player without a hype user id never DJs, leads or counts toward ready, and a client that sends the id -1 is disconnected.
+  - It reports the UDP ports it actually bound, so fuserd can stop a server that missed its assigned ones.
+  - It does not relay discs of custom songs fuserd lists as not loaded by every player (`blocked_songs`).
+  - After `FDS_MAX_UPTIME_HOURS` (any mode) it reports `recycle_pending` and exits once empty and in the Lobby. A server fuserd no longer knows (401 replies, or no reply) exits by itself.
   - It answers FUSER's session-browser beacon.
 - **Venues:** each of FUSER's six venues has its own empty server world, and the session's time of day can be set.
 - **Optional FUSER install:** a licensed install can be mounted read-only to read the venue catalogue. FDS never redistributes or loads FUSER's assets. Content that clients reference is replaced on the server by empty placeholder objects at the same paths, and each client resolves the path to its own copy.
+
+## Status
+
+- **DJ tricks are not relayed.** FDS has no `UTrickState`, so trick results stay zero. [docs/TRICKSTATE.md](docs/TRICKSTATE.md) records what the native code does.
+- **Not yet compiled or tested on EGS:** the player-chosen set length, the empty-DJ-queue handling, the -1 id checks, parked-viewer promotion, the rebuilt late-join snapshots, `blocked_songs`, the bound-port report, the recycle in every mode and the orphan exit. They were checked only by reading the code against the headers. In the log, `FDS: set length … (player N's choice…)` confirms that the EGS client sends its set length.
+- **`FitHottestMixToBpm`** follows the Steam build and is unconfirmed on EGS, so it is off by default.
 
 ## Repository layout
 
@@ -197,7 +208,7 @@ build/package-linux/LinuxServer/FuserServerServer.sh -port=7777 -log
 ```
 
 - **Ports:** clients join UDP `7777`. The session-browser beacon answers on the game port + 100.
-- **Settings:** the server is configured through environment variables, listed in [docker/README.md](docker/README.md), and through `Fuser/Config/DefaultGame.ini`, section `[/Script/FuserServer.FDSLobby]` (set length, DJ slots, lobby timer, results behaviour). Any ini value can be overridden at launch, for example `-ini:Game:[/Script/FuserServer.FDSLobby]:ResultsXPPayout=False`.
+- **Settings:** the server is configured through environment variables, listed in [docker/README.md](docker/README.md), and through `Fuser/Config/DefaultGame.ini`, section `[/Script/FuserServer.FDSLobby]` (set length and whether players choose it, DJ slots, lobby timer, results and hottest-mix behaviour, custom-song blocking). Any ini value can be overridden at launch, for example `-ini:Game:[/Script/FuserServer.FDSLobby]:ResultsXPPayout=False`.
 - **Venue:** `-FDSVenue=` / `FDS_VENUE` picks the venue. `-FDSMainStage` / `FDS_MAIN_STAGE=1` selects the Main Stage mode.
 - **FUSER install:** to mount one, set `FDS_FUSER_ROOT` to the folder holding `Fuser\Content\Paks`, and `FDS_PAK_KEY` to FUSER's AES pak key (64 hex digits or base64). The key is read from the environment only and never logged. Without an install, FDS runs on its own content. Only Venue01 then works, because FDS has stubs for Venue01's streamed sublevels only.
 

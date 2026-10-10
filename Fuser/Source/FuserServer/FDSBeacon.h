@@ -23,4 +23,7 @@ class UFDSLobbyAuthority;
 namespace FDSBeacon
 {
     void Start(UWorld* World, UFDSLobbyAuthority* Lobby);
+    // The UDP port the beacon is bound to (the net driver may have moved past a taken port), 0 when it is not
+    // listening. Reported to fuserd in the registration (FDSRegistration).
+    int32 BoundPort();
 }

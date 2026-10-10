@@ -40,6 +40,8 @@ public:
     virtual void OnSubmitRequest(AHypePlayerState* Sender, const FMultiplayerLiveRequest& Request, AHypePlayerState* ToDJ) = 0;
     virtual void OnUpdateGlobalAudioState(AHypePlayerState* Player, int32 Tick, int32 BPM, EKey Key, EKeyMode Mode) = 0;
     virtual void OnSetCoopRoundNumTurnMeasures(AHypePlayerState* Player, int32 NumRounds, int32 TurnMeasures) = 0;
+    // The client applied its state-of-the-world snapshot (_ServerSetHasSyncedStateOfTheWorld).
+    virtual void OnSetHasSyncedStateOfTheWorld(AHypePlayerState* Player, bool bSynced) = 0;
 
     static void Register(UWorld* World, IHypeServerAuthority* Authority);
     static void Unregister(UWorld* World, IHypeServerAuthority* Authority);

@@ -1,5 +1,6 @@
 #include "FDSLobbyAuthority.h"
 #include "FuserServer.h"
+#include "FDSAdmission.h"
 #include "DJPlayerState.h"
 #include "FDSMainStage.h"
 #include "FDSRegistration.h"
@@ -50,6 +51,12 @@ namespace
     constexpr int32 TicksPerBar = 1920;
     constexpr int32 LobbyBPM = 128;
 
+    // The set lengths FUSER's session menu offers: 1-3 rounds of 32, 64 or 128-bar turns.
+    bool IsOfferedSetLength(int32 Rounds, int32 TurnMeasures)
+    {
+        return Rounds >= 1 && Rounds <= 3 && (TurnMeasures == 32 || TurnMeasures == 64 || TurnMeasures == 128);
+    }
+
     // One stage record as FUN_14062f670 writes it: everything "unset" (-1 / 128 BPM) apart from type, screen, DJ, round.
     FMultiplayerGameStage MakeStage(EMultiplayerGameplayStage Type, EShellScreenType Screen, int32 DJIndex = -1, int32 Round = -1)
     {
@@ -89,18 +96,32 @@ void UFDSLobbyAuthority::Start(AHypeGameState* InGameState, UMultiplayerGameplay
     GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("RefreshDJsAfterSet"), bRefreshDJsAfterSet, GGameIni);
     GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("ResultsXPPayout"), bResultsXPPayout, GGameIni);
     GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("SkipHottestMixWhenSolo"), bSkipHottestMixWhenSolo, GGameIni);
+    GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("FitHottestMixToBpm"), bFitHottestMixToBpm, GGameIni);
+    GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("BlockUnreadyCustomSongs"), bBlockUnreadyCustomSongs, GGameIni);
+    GConfig->GetFloat(TEXT("/Script/FuserServer.FDSLobby"), TEXT("HottestMixPlaybackSeconds"), HottestMixPlaybackSeconds, GGameIni);
+    HottestMixPlaybackSeconds = FMath::Clamp(HottestMixPlaybackSeconds, 1.0f, 60.0f);
     FString Access = TEXT("Private");
     GConfig->GetString(TEXT("/Script/FuserServer.FDSLobby"), TEXT("ServerAccessState"), Access, GGameIni);
+    GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("PlayerChosenSetLength"), bPlayerChosenSetLength, GGameIni);
+    GConfig->GetFloat(TEXT("/Script/FuserServer.FDSLobby"), TEXT("SetLengthWaitSeconds"), SetLengthWaitSeconds, GGameIni);
+    SetLengthWaitSeconds = FMath::Max(SetLengthWaitSeconds, 0.0f);
     // A container fuserd starts gets the session's set length and access in its
-    // environment: FDS_ROUNDS / FDS_TURN_MEASURES (the ticket's choice; the first player's
-    // ServerSetCoopRoundNumTurnMeasures can still replace it) and FDS_SERVER_ACCESS (public / private).
+    // environment: FDS_ROUNDS / FDS_TURN_MEASURES (the ticket's choice: the fallbacks; the first player's
+    // ServerSetCoopRoundNumTurnMeasures can still replace it) and FDS_SERVER_ACCESS (public / private). Only the
+    // lengths FUSER's menu offers are taken (1-3 rounds, 32 / 64 / 128 bars).
     const int32 EnvRounds = FCString::Atoi(*FPlatformMisc::GetEnvironmentVariable(TEXT("FDS_ROUNDS")));
     const int32 EnvMeasures = FCString::Atoi(*FPlatformMisc::GetEnvironmentVariable(TEXT("FDS_TURN_MEASURES")));
-    if (EnvRounds > 0 && EnvRounds <= 10 && EnvMeasures >= 8 && EnvMeasures <= 512)
+    if (IsOfferedSetLength(EnvRounds, EnvMeasures))
     {
         CoopRounds = EnvRounds;
         CoopTurnMeasures = EnvMeasures;
     }
+    else if (EnvRounds != 0 || EnvMeasures != 0)
+    {
+        UE_LOG(LogFDS, Warning, TEXT("FDS: FDS_ROUNDS / FDS_TURN_MEASURES %d x %d not a FUSER set length (1-3 x 32/64/128): ignored"), EnvRounds, EnvMeasures);
+    }
+    InitialCoopRounds = CoopRounds;
+    InitialCoopTurnMeasures = CoopTurnMeasures;
     const FString EnvAccess = FPlatformMisc::GetEnvironmentVariable(TEXT("FDS_SERVER_ACCESS"));
     if (EnvAccess.Equals(TEXT("public"), ESearchCase::IgnoreCase) || EnvAccess.Equals(TEXT("private"), ESearchCase::IgnoreCase))
     {
@@ -108,7 +129,7 @@ void UFDSLobbyAuthority::Start(AHypeGameState* InGameState, UMultiplayerGameplay
     }
     ServerAccessState = Access == TEXT("Public") ? EServerAccessState::PublicServer : EServerAccessState::PrivateServer;
     UE_LOG(LogFDS, Display, TEXT("FDS: set length %d round(s) of %d measures%s; %s session"), CoopRounds, CoopTurnMeasures,
-        EnvRounds > 0 ? TEXT(" (FDS_ROUNDS / FDS_TURN_MEASURES)") : TEXT(""), *Access);
+        IsOfferedSetLength(EnvRounds, EnvMeasures) ? TEXT(" (FDS_ROUNDS / FDS_TURN_MEASURES)") : TEXT(""), *Access);
     GConfig->GetBool(TEXT("/Script/FuserServer.FDSLobby"), TEXT("PublicLobbyTimer"), bPublicLobbyTimer, GGameIni);
     GConfig->GetFloat(TEXT("/Script/FuserServer.FDSLobby"), TEXT("PublicLobbyTimerSeconds"), PublicLobbyTimerSeconds, GGameIni);
     GConfig->GetInt(TEXT("/Script/FuserServer.FDSLobby"), TEXT("PublicLobbyTimerMinDJs"), PublicLobbyTimerMinDJs, GGameIni);
@@ -161,6 +182,12 @@ void UFDSLobbyAuthority::Start(AHypeGameState* InGameState, UMultiplayerGameplay
         UE_LOG(LogFDS, Display, TEXT("FDS: Main Stage mode: the schedule's headliners DJ, everyone else spectates; no auto-start, lobby timer or leader; AFK kick after %d s"),
             AfkSecondsTillKickDefault);
     }
+    else
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: set length %s"), bPlayerChosenSetLength
+            ? *FString::Printf(TEXT("left to the players (PlayerChosenSetLength): the fallback applies %.0f s after the first join or at the countdown"), SetLengthWaitSeconds)
+            : TEXT("fixed at start (PlayerChosenSetLength=False)"));
+    }
     FString AfkText;
     for (const TPair<int32, int32>& Entry : AfkSecondsTillKick)
     {
@@ -171,8 +198,11 @@ void UFDSLobbyAuthority::Start(AHypeGameState* InGameState, UMultiplayerGameplay
     IHypeServerAuthority::Register(GetWorld(), this);
     if (UMultiplayerGameplayState* M = Mps())
     {
-        M->_numCoopFreestyleRounds = CoopRounds;
-        M->_coopTurnLengthMeasures = CoopTurnMeasures;
+        // Outside the Main Stage the set length stays unset (-1) for the players' choice (PlayerChosenSetLength); the
+        // stages are built from the fallbacks meanwhile.
+        const bool bLeaveUnset = bPlayerChosenSetLength && !bMainStage;
+        M->_numCoopFreestyleRounds = bLeaveUnset ? -1 : CoopRounds;
+        M->_coopTurnLengthMeasures = bLeaveUnset ? -1 : CoopTurnMeasures;
         // FUSER's set stage does nothing with an empty list: build it (slot 130), then enter the Lobby (slot 131).
         BuildStages();
         SetStage(0);
@@ -231,6 +261,12 @@ void UFDSLobbyAuthority::Tick(float DeltaSeconds)
     }
     AssignPendingTeams();
     RestoreDJsAfterSet();
+    PromoteParkedViewers();
+    if (SetLengthDeadline >= 0.0f && Now() >= SetLengthDeadline)
+    {
+        EnsureSetLength(TEXT("no choice within the wait after the first join"));
+    }
+    NudgeUnsyncedSnapshots();
     PruneActions();
     UpdateTimelineState();
     RecordMixHistory();
@@ -296,7 +332,7 @@ void UFDSLobbyAuthority::BuildStages()
     Stages.Add(MakeStage(EMultiplayerGameplayStage::Lobby, EShellScreenType::MultiplayerLobby));
     Stages.Add(MakeStage(EMultiplayerGameplayStage::RoundStart_SetupGameplay, EShellScreenType::Gameplay));
     Stages.Add(MakeStage(EMultiplayerGameplayStage::RoundStart_DJOrderIntro, EShellScreenType::Gameplay));
-    for (int32 Round = 0; Round < M->_numCoopFreestyleRounds; ++Round)
+    for (int32 Round = 0; Round < EffectiveRounds(); ++Round)
     {
         for (int32 DJ = 0; DJ < MaxNumDJs; ++DJ)
         {
@@ -519,6 +555,25 @@ void UFDSLobbyAuthority::SetStage(int32 Index)
         break;
     case EMultiplayerGameplayStage::RoundComplete_HottestMixPlayback:
         ResetMix(TEXT("hottest mix playback: the clients clear their decks"));
+        if (bFitHottestMixToBpm)
+        {
+            // The Steam build's ServerEnterStage (SERVER_SPEC 3.2): the replay lasts round(BPM x 12 / 240) bars - the
+            // camera's 12 seconds at the hottest mix's tempo - and every later stage moves by the difference.
+            // FitHottestMixToBpm: not confirmed in the EGS build, so off by default (PerStageMeasureCount's 6 bars).
+            FMultiplayerGameStage* Playback = Stage(CurrentStage);
+            const int32 MixBpm = M->_hottestMix.BPM;
+            const int32 Want = FMath::RoundToInt(MixBpm * HottestMixPlaybackSeconds / 240.0f);
+            if (Playback && MixBpm > 0 && Want > 0 && Playback->startMeasure != -1 && Playback->endMeasure != -1)
+            {
+                const int32 Have = Playback->endMeasure - Playback->startMeasure;
+                if (Want != Have)
+                {
+                    ShiftStagesFrom(CurrentStage, Want - Have);
+                    UE_LOG(LogFDS, Display, TEXT("FDS: hottest mix playback fitted to %d BPM: %d bar(s) instead of %d (FitHottestMixToBpm, %.0f s)"), MixBpm,
+                        Want, Have, HottestMixPlaybackSeconds);
+                }
+            }
+        }
         break;
     case EMultiplayerGameplayStage::Results_XPPayout:
     {
@@ -539,6 +594,16 @@ void UFDSLobbyAuthority::SetStage(int32 Index)
     {
         ShiftStagesFrom(CurrentStage, 1);
     }
+    // A snapshot built before the mix was cleared (HottestMixPlayback) or before the timeline restarted with the next
+    // round (Lobby) would be applied later with a stale mix or round: the joiners not yet synced get a new one.
+    if (Type == EMultiplayerGameplayStage::Lobby)
+    {
+        RebuildUnsyncedSnapshots(TEXT("lobby: new round"));
+    }
+    else if (Type == EMultiplayerGameplayStage::RoundComplete_HottestMixPlayback)
+    {
+        RebuildUnsyncedSnapshots(TEXT("hottest mix playback: mix cleared"));
+    }
     if (GameState.IsValid())
     {
         GameState->ForceNetUpdate();
@@ -546,7 +611,7 @@ void UFDSLobbyAuthority::SetStage(int32 Index)
     const FMultiplayerGameStage* S = Stage(CurrentStage);
     UE_LOG(LogFDS, Display, TEXT("FDS: stage %s of %d, from %s; bars %d-%d, now bar %d (tick %d, %d BPM, sync tick %d); rounds %d, turn measures %d, DJ slots %d%s"),
         *StageLabel(CurrentStage), M->_gameStages.Num(), *Previous, S ? S->startMeasure : -1, S ? S->endMeasure : -1, ClockMeasure(), ClockTick(), ClockBpm,
-        SyncTick, M->_numCoopFreestyleRounds, M->_coopTurnLengthMeasures, MaxNumDJs,
+        SyncTick, EffectiveRounds(), EffectiveTurnMeasures(), MaxNumDJs,
         CurrentDJ.IsValid() ? *FString::Printf(TEXT("; DJ player %d"), CurrentDJ->PlayerId) : TEXT(""));
 }
 
@@ -555,7 +620,7 @@ int32 UFDSLobbyAuthority::BarsFor(EMultiplayerGameplayStage Type) const
 {
     if (Type == EMultiplayerGameplayStage::Playing)
     {
-        return Mps() ? Mps()->_coopTurnLengthMeasures : -1;
+        return Mps() ? EffectiveTurnMeasures() : -1;
     }
     if (bMainStage && Type == EMultiplayerGameplayStage::Results_XPPayout)
     {
@@ -893,6 +958,7 @@ bool UFDSLobbyAuthority::CompleteLobby(const TCHAR* Why)
             bEveryoneReady ? TEXT("yes") : TEXT("no"));
         return false;
     }
+    EnsureSetLength(TEXT("lobby complete")); // the set's turns need their length before the layout
     const int32 NowMeasure = ClockMeasure();
     int32 Bar = 0;
     float Wait = 0.0f;
@@ -967,6 +1033,7 @@ void UFDSLobbyAuthority::UpdatePublicLobbyTimer()
     {
         return;
     }
+    EnsureSetLength(TEXT("public lobby timer"));
     const int32 NowTick = ClockTick();
     const int32 Bar = static_cast<int32>((NowTick + static_cast<double>(PublicLobbyTimerSeconds) * ClockBpm * (TicksPerBeat / 60.0)) / TicksPerBar);
     const float Wait = SecondsUntilTick(Bar * TicksPerBar);
@@ -988,12 +1055,36 @@ EMultiplayerTeam UFDSLobbyAuthority::TeamForNewPlayer(const AHypePlayerState* Pl
     {
         return MainStageTeam(Player);
     }
+    if (!IsIdentified(Player))
+    {
+        return EMultiplayerTeam::Spectator; // no hype user id: never a DJ (an invisible DJ splits the clients' queues)
+    }
     int32 DJs = 0;
     for (AHypePlayerState* Other : Players(Player))
     {
         DJs += Other->_team == EMultiplayerTeam::DJ ? 1 : 0;
     }
     return DJs < MaxNumDJs ? EMultiplayerTeam::DJ : EMultiplayerTeam::Spectator;
+}
+
+// A player counts for the DJ team, leadership and readiness only with a hype user id above 0 (the stock
+// ServerSetHypeUserId_Validate already refuses -1). Without fuserd tokens (local and direct-join runs, test clients
+// without an id) everyone counts, as before.
+bool UFDSLobbyAuthority::IsIdentified(const AHypePlayerState* Player) const
+{
+    return Player && (Player->_hypeUserId > 0 || !FDSAdmission::IsRequired());
+}
+
+bool UFDSLobbyAuthority::HasLeader() const
+{
+    for (AHypePlayerState* Player : Players())
+    {
+        if (Player->_isSessionLeader)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // FUN_1406963e0: a team change clears both ready bits.
@@ -1162,14 +1253,22 @@ void UFDSLobbyAuthority::OnPlayerJoined(AHypePlayerState* Player)
     // index OnReps) left that player out (two DJs on the server, one in each client's queue).
     // A player that never sends its hype user id gets a team after TeamFallbackSeconds.
     PendingTeam.Add(Player, Now());
-    bool bHasLeader = bMainStage; // the Main Stage has no session leader
-    for (AHypePlayerState* Other : Players(Player))
+    // With fuserd tokens the login's hype user id was checked against the token's user (FDSAdmission): it stays the
+    // player's id (OnSetHypeUserId), as the Main Stage keeps its admitted id.
+    if (!bMainStage && FDSAdmission::IsRequired() && Player->_hypeUserId > 0)
     {
-        bHasLeader |= Other->_isSessionLeader;
+        AdmittedUserIds.Add(Player, Player->_hypeUserId);
     }
-    if (!bHasLeader)
+    // The first identified player leads; one still without a hype user id may become the leader once it sends one.
+    if (!bMainStage && !HasLeader() && IsIdentified(Player)) // the Main Stage has no session leader
     {
         SetSessionLeader(Player);
+    }
+    // The set length waits for the creator's choice (PlayerChosenSetLength) at most SetLengthWaitSeconds.
+    const UMultiplayerGameplayState* M = Mps();
+    if (!bMainStage && SetLengthDeadline < 0.0f && M && (M->_numCoopFreestyleRounds == -1 || M->_coopTurnLengthMeasures == -1))
+    {
+        SetLengthDeadline = Now() + SetLengthWaitSeconds;
     }
     AssignDJIndices();
     RebuildDJQueue();
@@ -1191,19 +1290,37 @@ void UFDSLobbyAuthority::OnPlayerJoined(AHypePlayerState* Player)
 // the master clock): the joiner's consumer (FUN_14069bc90) marks every item stamped at or before it completed without
 // running it, so the actions already in the mix are not replayed and the later ones run. The copies keep their
 // UniqueIds; FFastArraySerializerItem's copy resets the ReplicationID for the snapshot's arrays.
+// The client applies a snapshot only outside None / HottestMixIntro / HottestMixPlayback, so one built at the join can
+// wait a while: until the client acknowledges it (OnSetHasSyncedStateOfTheWorld) it is rebuilt from scratch whenever
+// the mix is cleared or the round changes (RebuildUnsyncedSnapshots), as FuserProject's sotw.lua does.
 void UFDSLobbyAuthority::SeedStateOfTheWorld(AHypePlayerState* Player)
 {
     FStateOfTheWorld& World = Player->_stateOfTheWorld;
-    if (World.AtMasterTick != -1)
+    for (FMultiplayerActionArray* Array : {&World.GlobalAudioState, &World.DeckSoloMuteStates, &World.ActiveGridInstruments, &World.DeckPlayingState,
+                                           &World.DeckCuedState, &World.TrackGainState, &World.AudioEffectState})
     {
-        return;
+        if (Array->ActionItems.Num() > 0)
+        {
+            Array->ActionItems.Reset();
+            Array->MarkArrayDirty();
+        }
     }
-    const int32 Now = ClockTick();
+    FFDSUnsyncedSnapshot& Record = UnsyncedSnapshots.FindOrAdd(TWeakObjectPtr<AHypePlayerState>(Player));
+    if (Record.Builds == 0)
+    {
+        Record.JoinedAt = Now();
+    }
+    ++Record.Builds;
+    Record.NextNudgeAt = Now() + NudgeInterval(Record.Builds);
+    const int32 MasterTick = ClockTick();
     const bool bWithMix = Mix.Actions > 0 && Mix.Tick >= 0;
-    int32 AtTick = Now > 0 ? Now - 1 : -2; // never -1, which means "no snapshot"
+    // An empty mix: the cut-off is ClientNumMeasuresBehind bars back (SERVER_SPEC 4.5: ServerMasterTick - 1920, at
+    // least 0), where the listeners' clocks are, so an item the others have yet to play still runs for the joiner.
+    // Never -1, which means "no snapshot".
+    int32 AtTick = FMath::Max(0, MasterTick - ClientNumMeasuresBehind * TicksPerBar - 1);
     if (bWithMix)
     {
-        AtTick = Now >= 0 ? FMath::Min(Mix.Tick, Now) : Mix.Tick;
+        AtTick = MasterTick >= 0 ? FMath::Min(Mix.Tick, MasterTick) : Mix.Tick;
     }
     auto AddItem = [this, AtTick](FMultiplayerActionArray& Array, EMultiplayerActionType Type) -> FMultiplayerActionItemEntry&
     {
@@ -1246,13 +1363,25 @@ void UFDSLobbyAuthority::SeedStateOfTheWorld(AHypePlayerState* Player)
     }
     if (bWithMix)
     {
+        // A disc folded in before fuserd blocked its custom song (OnRecordAction) is left out: an unresolvable cel
+        // stalls the snapshot on a client that lacks the song.
+        auto IsBlockedDisc = [this](const FMultiplayerActionItemEntry& Disc)
+        {
+            return bBlockUnreadyCustomSongs && FFDSRegistration::Get().IsCustomSongBlocked(Disc.celShortName);
+        };
         for (const TPair<uint8, FMultiplayerActionItemEntry>& Entry : Mix.Playing)
         {
-            CopyInto(World.DeckPlayingState, Entry.Value, EActionAfterDiscSpawn::Play);
+            if (!IsBlockedDisc(Entry.Value))
+            {
+                CopyInto(World.DeckPlayingState, Entry.Value, EActionAfterDiscSpawn::Play);
+            }
         }
         for (const TPair<uint8, FMultiplayerActionItemEntry>& Entry : Mix.Cued)
         {
-            CopyInto(World.DeckCuedState, Entry.Value, EActionAfterDiscSpawn::Queue);
+            if (!IsBlockedDisc(Entry.Value))
+            {
+                CopyInto(World.DeckCuedState, Entry.Value, EActionAfterDiscSpawn::Queue);
+            }
         }
         for (const TPair<uint8, FMultiplayerActionItemEntry>& Entry : Mix.Gain)
         {
@@ -1271,12 +1400,84 @@ void UFDSLobbyAuthority::SeedStateOfTheWorld(AHypePlayerState* Player)
     World.InRound = RoundIndex;
     Player->ForceNetUpdate();
     const int32 Bpm = World.GlobalAudioState.ActionItems[0].MasterBpm;
-    UE_LOG(LogFDS, Display, TEXT("FDS: player %d state of the world seeded: tick %d, round %d, %d BPM, key %d, mode %d"), Player->PlayerId, AtTick,
-        RoundIndex, Bpm, static_cast<int32>(World.GlobalAudioState.ActionItems[0].MasterKey), static_cast<int32>(World.GlobalAudioState.ActionItems[0].MasterMode));
+    UE_LOG(LogFDS, Display, TEXT("FDS: player %d state of the world %s: tick %d, round %d, %d BPM, key %d, mode %d"), Player->PlayerId,
+        Record.Builds > 1 ? *FString::Printf(TEXT("rebuilt (#%d, not synced yet)"), Record.Builds) : TEXT("seeded"), AtTick, RoundIndex, Bpm,
+        static_cast<int32>(World.GlobalAudioState.ActionItems[0].MasterKey), static_cast<int32>(World.GlobalAudioState.ActionItems[0].MasterMode));
+    if (Record.Builds == SnapshotWarnBuilds)
+    {
+        // FuserProject sees this when a snapshot names a cel the client cannot resolve (SERVER_SPEC 4.5): the client
+        // retries every tick and never acknowledges. Replication nudges back off from here.
+        UE_LOG(LogFDS, Warning, TEXT("FDS: player %d still has not synced its state of the world after %d snapshot(s) in %.0f s (a cel it cannot resolve?)"),
+            Player->PlayerId, Record.Builds, Now() - Record.JoinedAt);
+    }
     if (bWithMix)
     {
         UE_LOG(LogFDS, Display, TEXT("FDS: player %d late-join mix of %d action(s) (master tick %d): %d playing, %d cued, %d gains, %d effects, %d instruments"),
-            Player->PlayerId, Mix.Actions, Now, Mix.Playing.Num(), Mix.Cued.Num(), Mix.Gain.Num(), Mix.Effect.Num(), Mix.Instrument.Num());
+            Player->PlayerId, Mix.Actions, MasterTick, Mix.Playing.Num(), Mix.Cued.Num(), Mix.Gain.Num(), Mix.Effect.Num(), Mix.Instrument.Num());
+    }
+}
+
+void UFDSLobbyAuthority::RebuildUnsyncedSnapshots(const TCHAR* Why)
+{
+    TArray<AHypePlayerState*> Rebuild;
+    for (auto It = UnsyncedSnapshots.CreateIterator(); It; ++It)
+    {
+        AHypePlayerState* Player = It.Key().Get();
+        if (!Player || Player->IsPendingKill())
+        {
+            It.RemoveCurrent();
+            continue;
+        }
+        Rebuild.Add(Player);
+    }
+    for (AHypePlayerState* Player : Rebuild)
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d has not synced its state of the world: snapshot rebuilt (%s)"), Player->PlayerId, Why);
+        SeedStateOfTheWorld(Player);
+    }
+}
+
+// Every SnapshotNudgeSeconds (SnapshotBackoffNudgeSeconds after SnapshotWarnBuilds snapshots) a player still waiting on
+// its snapshot gets a ForceNetUpdate: FUSER pins a PlayerState's NetUpdateFrequency to 1 Hz on every team change.
+void UFDSLobbyAuthority::NudgeUnsyncedSnapshots()
+{
+    const float WorldNow = Now();
+    for (auto It = UnsyncedSnapshots.CreateIterator(); It; ++It)
+    {
+        AHypePlayerState* Player = It.Key().Get();
+        if (!Player || Player->IsPendingKill())
+        {
+            It.RemoveCurrent();
+            continue;
+        }
+        FFDSUnsyncedSnapshot& Record = It.Value();
+        if (WorldNow >= Record.NextNudgeAt)
+        {
+            Record.NextNudgeAt = WorldNow + NudgeInterval(Record.Builds);
+            Player->ForceNetUpdate();
+        }
+    }
+}
+
+// _ServerSetHasSyncedStateOfTheWorld (FUN_1406d53b0 stores it at PS +0x1112): the client applied its snapshot (once
+// per PlayerState); from now on it consumes the actions itself, so its snapshot is no longer rebuilt.
+void UFDSLobbyAuthority::OnSetHasSyncedStateOfTheWorld(AHypePlayerState* Player, bool bSynced)
+{
+    const FFDSUnsyncedSnapshot* Record = UnsyncedSnapshots.Find(Player);
+    if (!bSynced)
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d reported its state of the world not synced"), Player->PlayerId);
+        return;
+    }
+    if (Record)
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d synced the state of the world (after %d snapshot(s), %.1f s)"), Player->PlayerId, Record->Builds,
+            Now() - Record->JoinedAt);
+        UnsyncedSnapshots.Remove(Player);
+    }
+    else
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d synced the state of the world"), Player->PlayerId);
     }
 }
 
@@ -1284,20 +1485,92 @@ void UFDSLobbyAuthority::OnPlayerLeft(AHypePlayerState* Player)
 {
     if (Player && Player->_isSessionLeader)
     {
+        // FUSER hands leadership to PlayerArray[0]; FDS skips players without a hype user id.
         TArray<AHypePlayerState*> Remaining = Players(Player);
-        if (Remaining.Num() > 0)
+        AHypePlayerState* const* Next = Remaining.FindByPredicate([this](const AHypePlayerState* Each) { return IsIdentified(Each); });
+        if (Next)
         {
-            SetSessionLeader(Remaining[0]);
+            SetSessionLeader(*Next);
         }
         Player->_isSessionLeader = false;
     }
+    AdmittedUserIds.Remove(Player);
+    ParkedViewers.Remove(Player);
+    UnsyncedSnapshots.Remove(Player);
     Leaving = Player; // still in PlayerArray during Logout: excluded from the rebuild
     DropPerformer(Player);
     AssignDJIndices();
     RebuildDJQueue();
     UpdateEveryoneReady();
     LogPlayers(TEXT("left"));
+    if (!bMainStage && Players().Num() == 0)
+    {
+        // The last player left. A server that stays up (FDS_EXIT_WHEN_EMPTY=0, or before fuserd stops it) goes back to
+        // the start's unset set length, so the next session's creator chooses again.
+        SetLengthDeadline = -1.0f;
+        bSetLengthChosen = false;
+        CoopRounds = InitialCoopRounds;
+        CoopTurnMeasures = InitialCoopTurnMeasures;
+        UMultiplayerGameplayState* M = Mps();
+        if (M && bPlayerChosenSetLength && (M->_numCoopFreestyleRounds != -1 || M->_coopTurnLengthMeasures != -1))
+        {
+            M->_numCoopFreestyleRounds = -1;
+            M->_coopTurnLengthMeasures = -1;
+            UE_LOG(LogFDS, Display, TEXT("FDS: server empty: set length unset again (fallback %d round(s) of %d measures)"), CoopRounds, CoopTurnMeasures);
+        }
+        else if (M && !bPlayerChosenSetLength)
+        {
+            M->_numCoopFreestyleRounds = CoopRounds;
+            M->_coopTurnLengthMeasures = CoopTurnMeasures;
+        }
+        if (CurrentStageType() == EMultiplayerGameplayStage::Lobby && SetStartMeasure == -1)
+        {
+            BuildStages(); // an idle Lobby: the turns follow the fallbacks again (a set in progress rebuilds in its Lobby)
+            if (GameState.IsValid())
+            {
+                GameState->ForceNetUpdate();
+            }
+        }
+    }
+    CheckEmptyDJQueue(TEXT("player left"));
     Leaving = nullptr;
+}
+
+// No DJ left in the queue (every DJ left or became a viewer). A Lobby countdown is cancelled: the set would otherwise
+// start with no performer. A set still in its turns returns to the Lobby (the viewers would sit through an empty
+// set); the round-complete and results stages run out by themselves. Un-readying never cancels a countdown here.
+void UFDSLobbyAuthority::CheckEmptyDJQueue(const TCHAR* Why)
+{
+    // Private sessions only: a Main Stage set keeps its schedule and runs out to its Results (PublishMainStageResults).
+    if (bMainStage || DJQueue.Num() > 0 || !Mps())
+    {
+        return;
+    }
+    const EMultiplayerGameplayStage Type = CurrentStageType();
+    if (Type == EMultiplayerGameplayStage::Lobby)
+    {
+        FMultiplayerGameStage* LobbyStage = Stage(CurrentStage);
+        if (!LobbyStage || (LobbyStage->ServerWorldTimeStageEnd == -1.0f && SetStartMeasure == -1))
+        {
+            return;
+        }
+        SetStartMeasure = -1;
+        bLobbyTimerRunning = false;
+        BuildStages(); // a fresh Lobby stage (end -1, 60 s) and no laid-out bars
+        if (GameState.IsValid())
+        {
+            GameState->ForceNetUpdate();
+        }
+        UE_LOG(LogFDS, Display, TEXT("FDS: lobby countdown cancelled: no DJ left (%s)"), Why);
+        return;
+    }
+    const bool bInTurns = Type == EMultiplayerGameplayStage::RoundStart_SetupGameplay || Type == EMultiplayerGameplayStage::RoundStart_DJOrderIntro
+        || Type == EMultiplayerGameplayStage::LoadStageKit || Type == EMultiplayerGameplayStage::UpcomingDJ || Type == EMultiplayerGameplayStage::Playing;
+    if (CurrentStage > 0 && bInTurns)
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: no DJ left during the set (%s): back to the Lobby"), Why);
+        SetStage(0);
+    }
 }
 
 void UFDSLobbyAuthority::OnSetHypeUserId(AHypePlayerState* Player)
@@ -1313,12 +1586,93 @@ void UFDSLobbyAuthority::OnSetHypeUserId(AHypePlayerState* Player)
             Player->ForceNetUpdate();
         }
     }
+    else if (const int32* Admitted = AdmittedUserIds.Find(Player))
+    {
+        // Freestyle with fuserd tokens: the login's id was checked against the token (FDSAdmission) and stays.
+        if (Player->_hypeUserId != *Admitted)
+        {
+            UE_LOG(LogFDS, Warning, TEXT("FDS: player %d sent a hype user id other than its token-checked one; kept the admitted id"), Player->PlayerId);
+            Player->_hypeUserId = *Admitted;
+            Player->ForceNetUpdate();
+        }
+    }
     PendingTeam.Remove(Player);
-    SetTeam(Player, TeamForNewPlayer(Player));
+    const EMultiplayerTeam Previous = Player->_team;
+    const EMultiplayerTeam Team = TeamForNewPlayer(Player);
+    SetTeam(Player, Team);
+    NoteParked(Player, Team, Previous);
+    if (!bMainStage && !HasLeader() && IsIdentified(Player))
+    {
+        SetSessionLeader(Player); // nobody identified led yet (see OnPlayerJoined)
+    }
+    else if (!bMainStage && Player->_isSessionLeader && !IsIdentified(Player))
+    {
+        TArray<AHypePlayerState*> Others = Players(Player);
+        AHypePlayerState* const* Next = Others.FindByPredicate([this](const AHypePlayerState* Each) { return IsIdentified(Each); });
+        if (Next)
+        {
+            SetSessionLeader(*Next);
+        }
+    }
     AssignDJIndices();
     RebuildDJQueue();
     UpdateEveryoneReady();
     LogPlayers(TEXT("set hype user id"));
+    CheckEmptyDJQueue(TEXT("set hype user id"));
+}
+
+// A player the team rule made a viewer only because every DJ slot was taken is promoted later
+// (PromoteParkedViewers). Players moved by the idle (AFK) rule or the lobby DJ refresh are never noted here.
+void UFDSLobbyAuthority::NoteParked(AHypePlayerState* Player, EMultiplayerTeam Team, EMultiplayerTeam Previous)
+{
+    // Only a player's first team counts (Unknown before): a later ServerSetHypeUserId does not park a chosen viewer.
+    if (bMainStage || Previous != EMultiplayerTeam::Unknown || Team != EMultiplayerTeam::Spectator || !IsIdentified(Player) ||
+        ParkedViewers.Contains(TWeakObjectPtr<AHypePlayerState>(Player)))
+    {
+        return;
+    }
+    ParkedViewers.Add(Player);
+    UE_LOG(LogFDS, Display, TEXT("FDS: player %d joins the viewers: all %d DJ slots taken (a DJ once one is free in the Lobby)"), Player->PlayerId, MaxNumDJs);
+}
+
+// In an idle Lobby (no countdown), after the lobby DJ refresh is done, viewers parked because the DJ slots were full
+// become DJs in their join order while slots are free.
+void UFDSLobbyAuthority::PromoteParkedViewers()
+{
+    if (ParkedViewers.Num() == 0 || bMainStage || DJsToRestore.Num() > 0 || CurrentStageType() != EMultiplayerGameplayStage::Lobby)
+    {
+        return;
+    }
+    const FMultiplayerGameStage* LobbyStage = Stage(CurrentStage);
+    if (!LobbyStage || LobbyStage->ServerWorldTimeStageEnd != -1.0f)
+    {
+        return; // a countdown runs: the teams for this set are settled
+    }
+    int32 Promoted = 0;
+    for (int32 i = 0; i < ParkedViewers.Num();)
+    {
+        AHypePlayerState* Player = ParkedViewers[i].Get();
+        if (!Player || Player->IsPendingKill() || Player->_team != EMultiplayerTeam::Spectator)
+        {
+            ParkedViewers.RemoveAt(i); // gone, or no longer a viewer
+            continue;
+        }
+        if (TeamForNewPlayer(Player) != EMultiplayerTeam::DJ)
+        {
+            break; // no slot free: the rest keep their place in line
+        }
+        ParkedViewers.RemoveAt(i);
+        SetTeam(Player, EMultiplayerTeam::DJ);
+        AssignDJIndices();
+        ++Promoted;
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d moved from the viewers to a free DJ slot (parked while the slots were full)"), Player->PlayerId);
+    }
+    if (Promoted > 0)
+    {
+        RebuildDJQueue();
+        UpdateEveryoneReady();
+        LogPlayers(TEXT("parked viewers promoted"));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- DJ actions
@@ -1329,6 +1683,18 @@ void UFDSLobbyAuthority::OnSetHypeUserId(AHypePlayerState* Player)
 // listeners' one-bar buffer is the only margin.
 void UFDSLobbyAuthority::OnRecordAction(AHypePlayerState* Player, FMultiplayerActionItemEntry& Item)
 {
+    // A disc of a custom song some player in the session cannot load would stall that DJ's whole action queue on that
+    // player's client (the consumer waits on the unknown cel): fuserd lists those songs, and their discs are not
+    // relayed (FuserProject actions.lua's custom song guard). Recorded nowhere, so not in the mix or a snapshot either.
+    FString BlockedSong;
+    if (bBlockUnreadyCustomSongs && Item.ActionType == EMultiplayerActionType::SpawnDisc &&
+        FFDSRegistration::Get().IsCustomSongBlocked(Item.celShortName, &BlockedSong))
+    {
+        const int32 Blocked = ++ActionCounts.FindOrAdd(TEXT("SpawnDisc (blocked custom song)"));
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d disc %s (custom song %s) not relayed: not loaded by every player (#%d)"), Player->PlayerId,
+            *Item.celShortName.ToString(), *BlockedSong, Blocked);
+        return;
+    }
     Item.UniqueId = NextActionId++;
     // A late joiner's AtMasterTick is the mix's newest stamp (SeedStateOfTheWorld) and its consumer skips items at or
     // before it. A GlobalAudioState can come stamped earlier (the first of a set is stamped -1); it runs on arrival, so
@@ -1459,8 +1825,8 @@ void UFDSLobbyAuthority::ResetResults(AHypePlayerState* Player)
     Results->_results = FGameplayResults();
     FGameplayResults& R = Results->_results;
     R.PraiseResults.PraiseCounts.SetNumZeroed(static_cast<int32>(EMultiplayerPraiseType::Num));
-    const int32 Rounds = FMath::Max(M->_numCoopFreestyleRounds, 0);
-    const int32 Measures = FMath::Max(M->_coopTurnLengthMeasures, 0);
+    const int32 Rounds = FMath::Max(EffectiveRounds(), 0); // the fallbacks while the set length is unset
+    const int32 Measures = FMath::Max(EffectiveTurnMeasures(), 0);
     for (TArray<FPerMeasureResultSingleRoundStat>* Table : {&R.PerMeasureResults.RequestsCompleted, &R.PerMeasureResults.PraiseReceived,
                                                             &R.PerMeasureResults.SnapshotsReceived})
     {
@@ -1987,6 +2353,17 @@ void UFDSLobbyAuthority::PruneActions()
         return;
     }
     const int32 Keep = (ClientNumMeasuresBehind + 3) * TicksPerBar;
+    // A joiner that has not applied its snapshot yet (a loader install wait can hold it for 30 s and more) still has to
+    // run every item after its snapshot's cut-off: those stay, for at most SnapshotPruneHoldSeconds after its join.
+    int32 HoldAfter = MAX_int32;
+    for (const TPair<TWeakObjectPtr<AHypePlayerState>, FFDSUnsyncedSnapshot>& Entry : UnsyncedSnapshots)
+    {
+        const AHypePlayerState* Joiner = Entry.Key.Get();
+        if (Joiner && Now() - Entry.Value.JoinedAt < SnapshotPruneHoldSeconds && Joiner->_stateOfTheWorld.InRound == RoundIndex)
+        {
+            HoldAfter = FMath::Min(HoldAfter, Joiner->_stateOfTheWorld.AtMasterTick);
+        }
+    }
     int32 Removed = 0;
     int32 Left = 0;
     for (AHypePlayerState* Player : Players())
@@ -1996,7 +2373,7 @@ void UFDSLobbyAuthority::PruneActions()
         Actions.ActionItems.RemoveAll([&](const FMultiplayerActionItemEntry& Item)
         {
             const float* RecordedAt = ActionRecordedAt.Find(Item.UniqueId);
-            const bool bConsumed = RecordedAt && Now() - *RecordedAt > 30.0f && Master > Item.MasterTimelineTick + Keep;
+            const bool bConsumed = RecordedAt && Now() - *RecordedAt > 30.0f && Master > Item.MasterTimelineTick + Keep && Item.MasterTimelineTick <= HoldAfter;
             const bool bStale = Item.MasterTimelineTick > Master + 2 * TicksPerBar;
             if (bConsumed || bStale)
             {
@@ -2099,7 +2476,9 @@ void UFDSLobbyAuthority::AssignPendingTeams()
             if (Player->_team == EMultiplayerTeam::Unknown)
             {
                 UE_LOG(LogFDS, Display, TEXT("FDS: player %d sent no hype user id within %.0f s: team assigned by the server"), Player->PlayerId, TeamFallbackSeconds);
-                SetTeam(Player, TeamForNewPlayer(Player));
+                const EMultiplayerTeam Team = TeamForNewPlayer(Player);
+                SetTeam(Player, Team);
+                NoteParked(Player, Team, EMultiplayerTeam::Unknown);
                 bChanged = true;
             }
         }
@@ -2155,11 +2534,18 @@ void UFDSLobbyAuthority::OnRequestTeamChange(AHypePlayerState* Player, EMultipla
         UE_LOG(LogFDS, Display, TEXT("FDS: player %d team change to DJ refused: %d DJ slots taken"), Player->PlayerId, DJQueue.Num());
         return;
     }
+    if (NewTeam == EMultiplayerTeam::DJ && !IsIdentified(Player))
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: player %d team change to DJ refused: no hype user id"), Player->PlayerId);
+        return;
+    }
+    ParkedViewers.Remove(Player); // the player's own choice from now on
     SetTeam(Player, NewTeam);
     AssignDJIndices();
     RebuildDJQueue();
     UpdateEveryoneReady();
     LogPlayers(TEXT("team change"));
+    CheckEmptyDJQueue(TEXT("team change"));
 }
 
 // FUN_14062bac0 through the leader's RPC (HypeServerRpcs.cpp checks the leader).
@@ -2203,7 +2589,11 @@ void UFDSLobbyAuthority::OnUpdateGlobalAudioState(AHypePlayerState* Player, int3
 }
 
 // ServerSetCoopRoundNumTurnMeasures, empty in FUSER's shipping build: its dedicated server took the
-// set length from the first player who sends it (a public ticket's turn length isn't reliable). Only in the Lobby before its countdown; later calls are ignored.
+// set length from the first player who sends it (a public ticket's turn length isn't reliable). The client sends it only
+// while either MPS value is -1 (FUN_1406d63b0), so the values start unset (PlayerChosenSetLength). Only in the Lobby
+// before its countdown, and only the lengths FUSER's menu offers (1-3 rounds, 32 / 64 / 128 bars); later calls are
+// ignored. A public session keeps its ticket's rounds (fuserd matches public sessions on them) and takes only the turn
+// length.
 void UFDSLobbyAuthority::OnSetCoopRoundNumTurnMeasures(AHypePlayerState* Player, int32 NumRounds, int32 TurnMeasures)
 {
     const FMultiplayerGameStage* LobbyStage = Stage(CurrentStage);
@@ -2213,13 +2603,19 @@ void UFDSLobbyAuthority::OnSetCoopRoundNumTurnMeasures(AHypePlayerState* Player,
             bMainStage ? TEXT("Main Stage") : bSetLengthChosen ? TEXT("already chosen") : TEXT("not in an open Lobby"));
         return;
     }
-    if (NumRounds < 1 || NumRounds > 10 || TurnMeasures < 8 || TurnMeasures > 512)
+    if (!IsOfferedSetLength(NumRounds, TurnMeasures))
     {
-        UE_LOG(LogFDS, Warning, TEXT("FDS: player %d set length %d x %d out of range"), Player->PlayerId, NumRounds, TurnMeasures);
+        UE_LOG(LogFDS, Warning, TEXT("FDS: player %d set length %d x %d not offered by FUSER (1-3 x 32/64/128): ignored"), Player->PlayerId, NumRounds,
+            TurnMeasures);
         return;
     }
     bSetLengthChosen = true;
-    CoopRounds = NumRounds;
+    SetLengthDeadline = -1.0f;
+    const bool bKeepRounds = IsPublicSession() && NumRounds != CoopRounds;
+    if (!IsPublicSession())
+    {
+        CoopRounds = NumRounds;
+    }
     CoopTurnMeasures = TurnMeasures;
     if (UMultiplayerGameplayState* M = Mps())
     {
@@ -2235,7 +2631,42 @@ void UFDSLobbyAuthority::OnSetCoopRoundNumTurnMeasures(AHypePlayerState* Player,
     {
         GameState->ForceNetUpdate();
     }
-    UE_LOG(LogFDS, Display, TEXT("FDS: set length %d round(s) of %d measures (player %d's choice)"), CoopRounds, CoopTurnMeasures, Player->PlayerId);
+    UE_LOG(LogFDS, Display, TEXT("FDS: set length %d round(s) of %d measures (player %d's choice%s)"), CoopRounds, CoopTurnMeasures, Player->PlayerId,
+        bKeepRounds ? *FString::Printf(TEXT("; %d round(s) asked, the public ticket's rounds kept"), NumRounds) : TEXT(""));
+}
+
+int32 UFDSLobbyAuthority::EffectiveRounds() const
+{
+    const UMultiplayerGameplayState* M = Mps();
+    return M && M->_numCoopFreestyleRounds > 0 ? M->_numCoopFreestyleRounds : CoopRounds;
+}
+
+int32 UFDSLobbyAuthority::EffectiveTurnMeasures() const
+{
+    const UMultiplayerGameplayState* M = Mps();
+    return M && M->_coopTurnLengthMeasures > 0 ? M->_coopTurnLengthMeasures : CoopTurnMeasures;
+}
+
+// Nobody chose a set length (PlayerChosenSetLength): the fallbacks (Game.ini / FDS_ROUNDS / FDS_TURN_MEASURES) are
+// written to the MPS, SetLengthWaitSeconds after the first join or when a countdown starts. The stages and the result
+// tables were already built from the fallbacks (EffectiveRounds / EffectiveTurnMeasures), so nothing is rebuilt and a
+// countdown's layout stays.
+void UFDSLobbyAuthority::EnsureSetLength(const TCHAR* Why)
+{
+    SetLengthDeadline = -1.0f;
+    UMultiplayerGameplayState* M = Mps();
+    if (bMainStage || !M || (M->_numCoopFreestyleRounds != -1 && M->_coopTurnLengthMeasures != -1))
+    {
+        return;
+    }
+    M->_numCoopFreestyleRounds = EffectiveRounds();
+    M->_coopTurnLengthMeasures = EffectiveTurnMeasures();
+    if (GameState.IsValid())
+    {
+        GameState->ForceNetUpdate();
+    }
+    UE_LOG(LogFDS, Display, TEXT("FDS: set length %d round(s) of %d measures (no player's choice: fallback; %s)"), M->_numCoopFreestyleRounds,
+        M->_coopTurnLengthMeasures, Why);
 }
 
 FFDSLobbyStatus UFDSLobbyAuthority::GetStatus() const
@@ -2276,6 +2707,11 @@ void UFDSLobbyAuthority::OnChangeLeaderTo(AHypePlayerState* Caller, AHypePlayerS
     {
         return;
     }
+    if (!IsIdentified(NewLeader))
+    {
+        UE_LOG(LogFDS, Display, TEXT("FDS: leader change to player %d refused: no hype user id"), NewLeader->PlayerId);
+        return;
+    }
     SetSessionLeader(NewLeader);
     LogPlayers(TEXT("leader change"));
 }
@@ -2287,7 +2723,7 @@ void UFDSLobbyAuthority::OnChangeLeaderTo(AHypePlayerState* Caller, AHypePlayerS
 void UFDSLobbyAuthority::OnUpdateAfkSeconds(AHypePlayerController* Controller, int32 AfkSeconds)
 {
     const UMultiplayerGameplayState* M = Mps();
-    const int32* Mapped = M ? AfkSecondsTillKick.Find(M->_coopTurnLengthMeasures) : nullptr;
+    const int32* Mapped = M ? AfkSecondsTillKick.Find(EffectiveTurnMeasures()) : nullptr;
     const int32 Threshold = Mapped ? *Mapped : AfkSecondsTillKickDefault;
     UE_LOG(LogFDS, Verbose, TEXT("FDS: AFK report %d s (kick at %d s)"), AfkSeconds, Threshold);
     if (!bEnableAfkChecks || AfkSeconds < Threshold || !Controller || Controller->IsPendingKillPending())

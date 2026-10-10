@@ -13,7 +13,12 @@ class UWorld;
 //   FDS_HEARTBEAT_SECONDS status interval (default 10)
 //   FDS_EXIT_WHEN_EMPTY   0 keeps the server running after its last player leaves (default: exit; the Main Stage never
 //                         exits when empty)
+//   FDS_MAX_UPTIME_HOURS  after this long (default 24; 0 = never) the server is recycled: it reports recycle_pending
+//                         (fuserd places nobody new on it) and exits once it is empty and in the Lobby
 // Without FDS_REGISTER_URL / FDS_SLOT_ID / FDS_REGISTER_TOKEN nothing is sent (local runs).
+// A container fuserd no longer knows (left over from an earlier fuserd run: every call answers 401 for
+// UnauthorizedExitSeconds, or nothing answers for NoReplyExitSeconds) exits at once when empty, else when its last
+// player leaves.
 class FFDSRegistration
 {
 public:
@@ -38,6 +43,11 @@ public:
     // Done gets the HTTP status (0 = no reply) and the reply body. Independent of the heartbeat's request.
     void Post(const TCHAR* Call, const FString& Body, TFunction<void(int32, const FString&)> Done);
 
+    // Whether a SpawnDisc's cel belongs to a custom song fuserd lists in blocked_songs (not loaded by every player in
+    // the session): <short>(_)?(bt|bs|ld|lp)(_trans)?, case-insensitive, longest shortname first. OutSong gets the
+    // shortname matched.
+    bool IsCustomSongBlocked(FName CelShortName, FString* OutSong = nullptr) const;
+
 private:
     FFDSRegistration();
     void Send(const TCHAR* Call, const FString& Body);
@@ -59,4 +69,15 @@ private:
     FFDSLobbyStatus Last;
     bool bHadPlayers = false;
     FString SessionIdValue;
+    bool bStatusDue = false;                  // send a status at the next chance (recycle_pending flipped)
+    bool bRecyclePending = false;             // past FDS_MAX_UPTIME_HOURS: exits once empty and in the Lobby
+    TArray<FString> BlockedSongs;             // fuserd's blocked_songs, lowercase, longest first
+
+    // Orphan detection: a container fuserd does not know any more.
+    static constexpr double UnauthorizedExitSeconds = 30.0;  // consecutive 401 replies this long
+    static constexpr double NoReplyExitSeconds = 600.0;      // no reply at all this long
+    bool bConfiguredExitWhenEmpty = true;     // bExitWhenEmpty before an orphan forced it on
+    bool bOrphaned = false;
+    double FirstUnauthorizedAt = -1.0;        // the first 401 of the current run of them; -1: none
+    double LastReplyAt = 0.0;                 // the last HTTP reply of any status (Start counts as one)
 };

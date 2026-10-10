@@ -74,6 +74,7 @@ public:
     virtual void OnSubmitRequest(AHypePlayerState* Sender, const FMultiplayerLiveRequest& Request, AHypePlayerState* ToDJ) override;
     virtual void OnUpdateGlobalAudioState(AHypePlayerState* Player, int32 Tick, int32 BPM, EKey Key, EKeyMode Mode) override;
     virtual void OnSetCoopRoundNumTurnMeasures(AHypePlayerState* Player, int32 NumRounds, int32 TurnMeasures) override;
+    virtual void OnSetHasSyncedStateOfTheWorld(AHypePlayerState* Player, bool bSynced) override;
 
     FFDSLobbyStatus GetStatus() const;
     bool IsPublicSession() const { return ServerAccessState == EServerAccessState::PublicServer; }
@@ -120,9 +121,16 @@ private:
     void ShiftStagesFrom(int32 Index, int32 Bars);              // FUN_140636bf0 tail
     void DropPerformer(AHypePlayerState* Player);               // a DJ left mid-set: their turn ends early
     FString StageLabel(int32 Index) const;
-    void SeedStateOfTheWorld(AHypePlayerState* Player);         // the dedicated server's late-join snapshot
+    void SeedStateOfTheWorld(AHypePlayerState* Player);         // the dedicated server's late-join snapshot (rebuildable)
+    void RebuildUnsyncedSnapshots(const TCHAR* Why);            // a new snapshot for every player that has not synced
+    void NudgeUnsyncedSnapshots();                              // ForceNetUpdate while a snapshot waits for its ack
     void AssignPendingTeams();
     void RestoreDJsAfterSet();
+    void NoteParked(AHypePlayerState* Player, EMultiplayerTeam Team, EMultiplayerTeam Previous);
+    void PromoteParkedViewers();                                // viewers parked because the DJ slots were full
+    void CheckEmptyDJQueue(const TCHAR* Why);                   // no DJ left: cancel the countdown / end the set
+    bool IsIdentified(const AHypePlayerState* Player) const;    // a hype user id above 0 (or no fuserd tokens)
+    bool HasLeader() const;
     void PruneActions();
     void ClearActions(const TCHAR* Why);
 
@@ -167,11 +175,36 @@ private:
     TMap<TWeakObjectPtr<AHypePlayerState>, float> PendingTeam; // admitted, awaiting ServerSetHypeUserId (world time)
     static constexpr float TeamFallbackSeconds = 2.0f;
     TArray<TWeakObjectPtr<AHypePlayerState>> DJsToRestore;      // lobby DJ refresh after a set
+    TArray<TWeakObjectPtr<AHypePlayerState>> ParkedViewers;     // made viewers only because the DJ slots were full (join order)
+    TMap<TWeakObjectPtr<AHypePlayerState>, int32> AdmittedUserIds; // the token-checked login hype user id (fuserd tokens only)
     float DJRestoreAt = 0.0f;
     static constexpr float DJRefreshSeconds = 1.0f;
     TMap<int32, float> ActionRecordedAt;                        // UniqueId -> world time recorded (pruning)
     TMap<FString, int32> ActionCounts;                          // per action type, this set
     float NextPruneAt = 0.0f;
+    // Late joiners whose client has not yet reported _ServerSetHasSyncedStateOfTheWorld(true): their snapshot is
+    // rebuilt when the mix or the round changes under it, replication is nudged, and PruneActions keeps the items
+    // after its cut-off. The entry goes on the ack or on leave.
+    struct FFDSUnsyncedSnapshot
+    {
+        float JoinedAt = 0.0f;   // world time the first snapshot was built
+        float NextNudgeAt = 0.0f;
+        int32 Builds = 0;        // snapshots built for this player
+    };
+    TMap<TWeakObjectPtr<AHypePlayerState>, FFDSUnsyncedSnapshot> UnsyncedSnapshots;
+    static constexpr float SnapshotNudgeSeconds = 3.0f;          // ForceNetUpdate interval while unsynced
+    static constexpr float SnapshotBackoffNudgeSeconds = 15.0f;  // ... after SnapshotWarnBuilds snapshots
+    static constexpr int32 SnapshotWarnBuilds = 5;               // warn (once) and back off after this many builds
+    static constexpr float SnapshotPruneHoldSeconds = 120.0f;    // PruneActions waits this long at most for a joiner
+    // By value, not via ?: on the constants: that would odr-use them, and C++14 has no out-of-line definition for them.
+    static float NudgeInterval(int32 Builds)
+    {
+        if (Builds >= SnapshotWarnBuilds)
+        {
+            return SnapshotBackoffNudgeSeconds;
+        }
+        return SnapshotNudgeSeconds;
+    }
     TSet<TWeakObjectPtr<AHypePlayerState>> HadTurn;             // idle rule: PS +0x1110
     TSet<TWeakObjectPtr<AHypePlayerState>> Acted;               // idle rule: PS +0x1111
     TMap<FName, FSerializableCraftedInstrumentCel> CraftedRegistry;            // GameState +0x448 in FUSER
@@ -235,7 +268,27 @@ private:
     bool bRefreshDJsAfterSet = true;               // lobby DJ refresh after a set (see SetStage, Lobby)
     bool bResultsXPPayout = true;                  // run Results_XPPayout after Results (see DriveStages)
     bool bSkipHottestMixWhenSolo = true;           // a one-player set skips the hottest-mix stages (see SetStage)
+    // BlockUnreadyCustomSongs (default True): a SpawnDisc of a custom song fuserd lists as not loaded by every player
+    // (FFDSRegistration blocked_songs) is not relayed, nor put in a late joiner's snapshot (see OnRecordAction).
+    bool bBlockUnreadyCustomSongs = true;
+    // FitHottestMixToBpm (default False, unverified on EGS): entering HottestMixPlayback, its length becomes
+    // round(_hottestMix.BPM x HottestMixPlaybackSeconds / 240) bars (the Steam ServerEnterStage rule) instead of
+    // PerStageMeasureCount's 6, and the later stages move by the difference.
+    bool bFitHottestMixToBpm = false;
+    float HottestMixPlaybackSeconds = 12.0f;       // the hottest-mix camera time the Steam rule fits the bars to
     bool bSetLengthChosen = false;                 // the first player's ServerSetCoopRoundNumTurnMeasures was taken
+    // PlayerChosenSetLength (default True): outside the Main Stage the MPS set length starts unset (-1), as on a FUSER
+    // host, so the session creator's client sends ServerSetCoopRoundNumTurnMeasures (it only does while a value is -1).
+    // CoopRounds / CoopTurnMeasures are the fallbacks until then; EnsureSetLength writes them SetLengthWaitSeconds after
+    // the first join, or at the latest when the countdown starts. False: the fallbacks are written at start.
+    bool bPlayerChosenSetLength = true;
+    float SetLengthWaitSeconds = 8.0f;
+    float SetLengthDeadline = -1.0f;               // world time EnsureSetLength applies the fallbacks; -1: not armed
+    int32 InitialCoopRounds = 3;                   // the fallbacks at start (restored when the server empties)
+    int32 InitialCoopTurnMeasures = 128;
+    int32 EffectiveRounds() const;                 // the MPS value, or the fallback while it is unset
+    int32 EffectiveTurnMeasures() const;
+    void EnsureSetLength(const TCHAR* Why);
     bool bPublicLobbyTimer = true;                 // a public session's Lobby counts down by itself (UpdatePublicLobbyTimer)
     float PublicLobbyTimerSeconds = 60.0f;         // PerStageRealtimeSeconds[Lobby]
     int32 PublicLobbyTimerMinDJs = 2;              // FUSER's rule: the timer needs two DJs in the queue
