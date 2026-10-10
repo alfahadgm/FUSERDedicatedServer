@@ -1,0 +1,123 @@
+diff --git a/Engine/Source/Runtime/Engine/Classes/Engine/PackageMapClient.h b/Engine/Source/Runtime/Engine/Classes/Engine/PackageMapClient.h
+index cd6d789..07f16ed 100644
+--- a/Engine/Source/Runtime/Engine/Classes/Engine/PackageMapClient.h
++++ b/Engine/Source/Runtime/Engine/Classes/Engine/PackageMapClient.h
+@@ -221,6 +221,15 @@ public:
+ 		ForceEnable		= 2,		// Force enable async loading
+ 	};
+ 
++	// FDS PATCH BEGIN (server missing-object resolver)
++	// Consulted on the NetGUID authority (server) when a client references an object by path (default NetGUID export)
++	// that is not in memory, before any load (UPackageMapClient::InternalLoadObject). Declined: stock behaviour (load).
++	// Created: OutObject is used. Deferred: unresolved without loading or logging; the game supplies the object once the
++	// expected class is known (FDS creates content placeholders in its UPackageMapClient::SerializeObject override).
++	enum class EServerMissingObject : uint8 { Declined, Created, Deferred };
++	static TFunction<EServerMissingObject(FName PathName, UObject* Outer, bool bIsPackage, UObject*& OutObject)> ServerMissingObjectResolver;
++	// FDS PATCH END
++
+ 	void			CleanReferences();
+ 	bool			SupportsObject( const UObject* Object, const TWeakObjectPtr<UObject>* WeakObjectPtr=nullptr /** Optional: pass in existing weakptr to prevent this function from constructing one internally */ ) const;
+ 	bool			IsDynamicObject( const UObject* Object );
+diff --git a/Engine/Source/Runtime/Engine/Private/PackageMapClient.cpp b/Engine/Source/Runtime/Engine/Private/PackageMapClient.cpp
+index 4fc1193..632b5ca 100644
+--- a/Engine/Source/Runtime/Engine/Private/PackageMapClient.cpp
++++ b/Engine/Source/Runtime/Engine/Private/PackageMapClient.cpp
+@@ -46,6 +46,10 @@ static const int INTERNAL_LOAD_OBJECT_RECURSION_LIMIT = 16;
+ 
+ static TAutoConsoleVariable<int32> CVarAllowAsyncLoading( TEXT( "net.AllowAsyncLoading" ), 0, TEXT( "Allow async loading" ) );
+ static TAutoConsoleVariable<int32> CVarIgnoreNetworkChecksumMismatch( TEXT( "net.IgnoreNetworkChecksumMismatch" ), 0, TEXT( "" ) );
++
++// FDS PATCH BEGIN (server missing-object resolver)
++TFunction<FNetGUIDCache::EServerMissingObject(FName, UObject*, bool, UObject*&)> FNetGUIDCache::ServerMissingObjectResolver;
++// FDS PATCH END
+ static TAutoConsoleVariable<int32> CVarReservedNetGuidSize(TEXT("net.ReservedNetGuidSize"), 512, TEXT("Reserved size in bytes for NetGUID serialization"));
+ extern FAutoConsoleVariableRef CVarEnableMultiplayerWorldOriginRebasing;
+ extern TAutoConsoleVariable<int32> CVarFilterGuidRemapping;
+@@ -968,6 +972,22 @@ FNetworkGUID UPackageMapClient::InternalLoadObject( FArchive & Ar, UObject *& Ob
+ 
+ 			Object = StaticFindObject(UObject::StaticClass(), ObjOuter, *PathName, false);
+ 
++			// FDS PATCH BEGIN (server missing-object resolver)
++			if (Object == nullptr && FNetGUIDCache::ServerMissingObjectResolver)
++			{
++				const FNetGUIDCache::EServerMissingObject Resolution = FNetGUIDCache::ServerMissingObjectResolver(FName(*PathName), ObjOuter, bIsPackage, Object);
++				if (Resolution == FNetGUIDCache::EServerMissingObject::Deferred)
++				{
++					Object = nullptr;
++					return NetGUID;
++				}
++				if (Resolution != FNetGUIDCache::EServerMissingObject::Created)
++				{
++					Object = nullptr;
++				}
++			}
++			// FDS PATCH END
++
+ 			if (Object == nullptr && bIsPackage)
+ 			{
+ 				// Try to load package if it wasn't found. Note load package fails if the package is already loaded.
+diff --git a/Engine/Source/Runtime/Engine/Private/World.cpp b/Engine/Source/Runtime/Engine/Private/World.cpp
+index 4e5c6b8..70c0955 100644
+--- a/Engine/Source/Runtime/Engine/Private/World.cpp
++++ b/Engine/Source/Runtime/Engine/Private/World.cpp
+@@ -4845,6 +4845,32 @@ bool UWorld::DestroySwappedPC(UNetConnection* Connection)
+ 	return false;
+ }
+ 
++// FDS PATCH BEGIN (login-token redaction)
++// Login URLs carry the player's session token (playerSessionId); the join log lines show it as <redacted>.
++static FString FDSRedactLoginURL(const FString& URL)
++{
++	static const TCHAR* const Key = TEXT("playerSessionId=");
++	FString Result = URL;
++	int32 From = 0;
++	for (;;)
++	{
++		const int32 At = Result.Find(Key, ESearchCase::IgnoreCase, ESearchDir::FromStart, From);
++		if (At == INDEX_NONE)
++		{
++			return Result;
++		}
++		const int32 Start = At + FCString::Strlen(Key);
++		int32 End = Start;
++		while (End < Result.Len() && Result[End] != TEXT('?') && Result[End] != TEXT('#'))
++		{
++			++End;
++		}
++		Result = Result.Left(Start) + TEXT("<redacted>") + Result.Mid(End);
++		From = Start;
++	}
++}
++// FDS PATCH END
++
+ void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+ {
+ 	if( NetDriver->ServerConnection )
+@@ -5006,7 +5032,8 @@ void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType,
+ 
+ 				if (bReceived)
+ 				{
+-					UE_LOG(LogNet, Log, TEXT("Login request: %s userId: %s platform: %s"), *Connection->RequestURL, UniqueIdRepl.IsValid() ? *UniqueIdRepl.ToDebugString() : TEXT("UNKNOWN"), *OnlinePlatformName);
++					// FDS PATCH: token redacted (FDSRedactLoginURL)
++					UE_LOG(LogNet, Log, TEXT("Login request: %s userId: %s platform: %s"), *FDSRedactLoginURL(Connection->RequestURL), UniqueIdRepl.IsValid() ? *UniqueIdRepl.ToDebugString() : TEXT("UNKNOWN"), *OnlinePlatformName);
+ 
+ 					// Compromise for passing splitscreen playercount through to gameplay login code,
+ 					// without adding a lot of extra unnecessary complexity throughout the login code.
+@@ -5076,7 +5103,7 @@ void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType,
+ 				{
+ 					// Spawn the player-actor for this network player.
+ 					FString ErrorMsg;
+-					UE_LOG(LogNet, Log, TEXT("Join request: %s"), *Connection->RequestURL);
++					UE_LOG(LogNet, Log, TEXT("Join request: %s"), *FDSRedactLoginURL(Connection->RequestURL)); // FDS PATCH: token redacted
+ 
+ 					FURL InURL( NULL, *Connection->RequestURL, TRAVEL_Absolute );
+ 
+@@ -5209,7 +5236,7 @@ void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType,
+ 						// create URL from string
+ 						FURL JoinSplitURL(NULL, *SplitRequestURL, TRAVEL_Absolute);
+ 
+-						UE_LOG(LogNet, Log, TEXT("JOINSPLIT: Join request: URL=%s"), *JoinSplitURL.ToString());
++						UE_LOG(LogNet, Log, TEXT("JOINSPLIT: Join request: URL=%s"), *FDSRedactLoginURL(JoinSplitURL.ToString())); // FDS PATCH: token redacted
+ 						APlayerController* PC = SpawnPlayActor(ChildConn, ROLE_AutonomousProxy, JoinSplitURL, ChildConn->PlayerId, ErrorMsg, uint8(Connection->Children.Num()));
+ 						if (PC == NULL)
+ 						{

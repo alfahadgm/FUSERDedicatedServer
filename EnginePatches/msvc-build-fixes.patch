@@ -1,0 +1,41 @@
+diff --git a/Engine/Source/Runtime/Experimental/Voronoi/Private/Voronoi/Voronoi.cpp b/Engine/Source/Runtime/Experimental/Voronoi/Private/Voronoi/Voronoi.cpp
+index 61460dc..bfe148e 100644
+--- a/Engine/Source/Runtime/Experimental/Voronoi/Private/Voronoi/Voronoi.cpp
++++ b/Engine/Source/Runtime/Experimental/Voronoi/Private/Voronoi/Voronoi.cpp
+@@ -1,5 +1,6 @@
+ // Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
+ #include "Voronoi/Voronoi.h"
++#include <limits>
+ 
+ 
+ THIRD_PARTY_INCLUDES_START
+@@ -80,7 +81,7 @@ namespace {
+ 
+ 		// If points are too far apart, voro++ will ask for unbounded memory to build its grid over space
+ 		// TODO: Figure out reasonable bounds / behavior for this case
+-		ensure(BoundingBoxSize.GetMax() < HUGE_VALF);
++		ensure(BoundingBoxSize.GetMax() < std::numeric_limits<float>::infinity());
+ 
+ 
+ 		int NumSites = Sites.Num();
+diff --git a/Engine/Source/Runtime/RenderCore/Private/RenderGraphBuilder.cpp b/Engine/Source/Runtime/RenderCore/Private/RenderGraphBuilder.cpp
+index 3535a6c..01c1ffd 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/RenderGraphBuilder.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/RenderGraphBuilder.cpp
+@@ -1,6 +1,7 @@
+ // Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
+ 
+ #include "RenderGraphBuilder.h"
++#include <limits>
+ #include "RenderCore.h"
+ #include "RenderTargetPool.h"
+ #include "RenderGraphResourcePool.h"
+@@ -55,7 +56,7 @@ FLinearColor GetClobberColor()
+ 		return FLinearColor(NAN, NAN, NAN, NAN);
+ 		break;
+ 	case 3:
+-		return FLinearColor(INFINITY, INFINITY, INFINITY, INFINITY);
++		return FLinearColor(std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity());
+ 		break;
+ 	default:
+ 		return FLinearColor(1000, 1000, 1000, 1000);

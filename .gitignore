@@ -1,0 +1,13 @@
+**/__pycache__/
+build/
+Fuser/Binaries/
+Fuser/Build/
+Fuser/DerivedDataCache/
+Fuser/Intermediate/
+Fuser/Saved/
+Fuser/.vs/
+Fuser/*.sln
+tools/uasset_json/bin/
+tools/uasset_json/obj/
+.idea/
+captures/

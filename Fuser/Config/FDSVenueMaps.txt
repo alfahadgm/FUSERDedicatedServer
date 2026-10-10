@@ -1,0 +1,6 @@
+/Game/Maps/Venue01/Venue01
+/Game/Maps/Venue02/Venue02
+/Game/Maps/Venue03/Venue03
+/Game/Maps/Venue04/Venue04
+/Game/Maps/Venue05/Venue05
+/Game/Maps/Venue06/Venue06

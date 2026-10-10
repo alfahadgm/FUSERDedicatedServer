@@ -1,0 +1,11 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "4.24",
+  "Description": "FDS dedicated server for FUSER: /Script/Hype network types (generated) plus server integration.",
+  "Modules": [
+    {"Name": "FuserServer", "Type": "Runtime", "LoadingPhase": "Default"},
+    {"Name": "Hype", "Type": "Runtime", "LoadingPhase": "Default"},
+    {"Name": "OnlineSubsystemHype", "Type": "Runtime", "LoadingPhase": "PreDefault"},
+    {"Name": "FDSEditor", "Type": "Editor", "LoadingPhase": "Default"}
+  ]
+}
